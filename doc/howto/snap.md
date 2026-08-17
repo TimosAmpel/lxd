@@ -233,6 +233,29 @@ To see all configuration options that are explicitly set on the snap, run:
 sudo snap get lxd
 ```
 
+### Configure feature gates
+
+Feature gates provide access to work-in-progress features and are disabled by default.
+
+```{warning}
+Feature gates enable unsupported and unfinished functionality.
+They must never be enabled them in a production environment.
+```
+
+To enable one or more features, set the `features` option to a comma-separated list:
+
+```bash
+sudo snap set lxd features=feature_name,another_feature
+```
+
+To disable all feature gates, run:
+
+```bash
+sudo snap unset lxd features
+```
+
+Restart the LXD daemon to apply feature gate changes to the server.
+
 For more information about snap configuration options, visit {ref}`snap:how-to-guides-work-with-snaps-configure-snaps` in the Snap documentation.
 
 (howto-snap-daemon)=
