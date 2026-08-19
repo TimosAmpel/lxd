@@ -8,6 +8,7 @@ import (
 
 	cli "github.com/canonical/lxd/shared/cmd"
 	"github.com/canonical/lxd/shared/version"
+	"github.com/canonical/lxd/shared/features"
 )
 
 type cmdVersion struct {
@@ -62,6 +63,11 @@ func (c *cmdVersion) run(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Client version: %s\n", clientVersion)
 	fmt.Printf("Server version: %s\n", serverVersion)
+
+	if features.IsOpen(features.Test) {
+		fmt.Println("lxd/version: Hello from the feature gate!")
+	}
+
 
 	return nil
 }

@@ -87,6 +87,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	if features.IsOpen(features.Test) {
+		fmt.Fprintln(os.Stderr, "lxd/main: Hello from the feature gate!")
+	}
+
 	// daemon command (main)
 	daemonCmd := cmdDaemon{}
 	app := daemonCmd.command()

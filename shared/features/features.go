@@ -30,6 +30,7 @@ type Feature string
 
 // EnvVar is the environment variable which holds the active features of LXD.
 const EnvVar = "LXD_FEATURES"
+const Test Feature = "test_feature"
 
 var (
 	mu   sync.RWMutex
