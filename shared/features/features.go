@@ -34,6 +34,7 @@ const (
 	envVar = "LXD_FEATURES"
 	// New supported feature previews should be defined as constances.
 	// Ex. FeatureX Feature = "feature_x"
+	 FeatureTest Feature = "feature_test"
 )
 
 var (
@@ -42,7 +43,9 @@ var (
 	// enabledFeaturePrevs = map[Feature]bool{
 	// 	FeatureX: false
 	// }
-	enabledFeaturePrevs = map[Feature]bool{}
+	enabledFeaturePrevs = map[Feature]bool{
+		FeatureTest: false,
+	}
 )
 
 func printAvailFeatures() {

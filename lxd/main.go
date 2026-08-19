@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 
 	"github.com/canonical/go-dqlite/v3"
@@ -13,6 +14,7 @@ import (
 	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/rsync"
 	cli "github.com/canonical/lxd/shared/cmd"
+	"github.com/canonical/lxd/shared/features"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/version"
 )
@@ -78,6 +80,10 @@ func (c *cmdGlobal) rawArgs(cmd *cobra.Command) []string {
 }
 
 func main() {
+	if features.IsEnabled(features.FeatureTest) {
+		fmt.Fprintln(os.Stderr, "lxd/main: Hello from the feature gate!")
+	}
+
 	// daemon command (main)
 	daemonCmd := cmdDaemon{}
 	app := daemonCmd.command()
