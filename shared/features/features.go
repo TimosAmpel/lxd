@@ -2,19 +2,19 @@
 // Feature previews expose unsupported and unfinished functionality. They MUST NOT
 // be enabled in production environments.
 //
-// Applications load enabled previews from the environment during startup:
+// Applications load enabled previews from the environment during startup.
+// The IsEnabled function is used though source code to checks if the feature
+// is enabled and activates related code:
 //
-//	err := features.LoadFromEnv(features.EnvVar)
-//
-// A feature declares a typed name and checks it before exposing preview code:
-//
-//	const experimentalFeature features.Feature = "experimental_feature"
-//	if features.IsEnabled(experimentalFeature) {
-//		registerExperimentalFeature()
+//	if features.IsEnabled(features.FeatureX) {
+//		...
 //	}
 //
-// Previews are disabled by default. Add a feature constant only with a real consumer,
-// and remove its preview check when the feature is ready for general use.
+// Where FeatureX is a defined constant in features' package.
+//
+// Feature previews are disabled by default. Add a new feature constant when its
+// implementation is still work-in-progress and remove the conditional code enablement
+// only when the feature is ready for general use.
 package features
 
 import (
@@ -22,49 +22,87 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"sync"
+	"maps"
+	"slices"
 )
 
 // Feature identifies an unsupported, work-in-progress feature.
 type Feature string
 
-// EnvVar is the environment variable which holds the active features of LXD.
-const EnvVar = "LXD_FEATURES"
-
-var (
-	mu      sync.RWMutex
-	enabled = map[Feature]struct{}{}
+const (
+	// envVar is the environment variable which holds the active features of LXD.
+	envVar = "LXD_FEATURES"
+	// New supported feature previews should be defined as constances.
+	// Ex. FeatureX Feature = "feature_x"
 )
 
+var (
+	// enabledFeaturePrevs holds the status of supported feature previews.
+	// Example:
+	// enabledFeaturePrevs = map[Feature]bool{
+	// 	FeatureX: false
+	// }
+	enabledFeaturePrevs = map[Feature]bool{}
+)
+
+func printAvailFeatures() {
+	fmt.Print("Available features are: ")
+	prevs := slices.Collect(maps.Keys(enabledFeaturePrevs))
+	last := len(prevs) - 1
+	for _, prev := range prevs[:last] {
+		fmt.Print(prev, ",")
+	}
+	fmt.Println(prevs[last])
+}
+
+func init() {
+	err := loadFromEnv(envVar)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		printAvailFeatures()
+		os.Exit(1)
+	}
+}
+
 // LoadFromEnv replaces the set of enabled feature previews from the environment.
-func LoadFromEnv(envVar string) error {
+func loadFromEnv(envVar string) error {
 	var namePattern = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
 	value := os.Getenv(envVar)
-
-	next := make(map[Feature]struct{})
 	if value != "" {
 		for _, name := range strings.Split(value, ",") {
+			// Check if feature name pattern in acceptable form
 			if !namePattern.MatchString(name) {
 				return fmt.Errorf("Invalid feature preview %q", name)
 			}
 
-			next[Feature(name)] = struct{}{}
+			// Check if feature name exists in supported list features
+			enabled, exist := enabledFeaturePrevs[Feature(name)]
+			if !exist {
+				return fmt.Errorf("Feature preview named \"%q\" is not supported", name)
+			}
+
+			// Check if feature name has already been provided
+			if enabled {
+				return fmt.Errorf("Feature preview %q has already been enabled", name)
+			}
+
+			// Enabled the feature preview
+			enabledFeaturePrevs[Feature(name)] = true
 		}
 	}
-
-	mu.Lock()
-	enabled = next
-	mu.Unlock()
 
 	return nil
 }
 
 // IsEnabled reports whether the feature preview is enabled.
 func IsEnabled(feature Feature) bool {
-	mu.RLock()
-	_, found := enabled[feature]
-	mu.RUnlock()
+	enabled, found := enabledFeaturePrevs[feature]
+	if !found {
+		fmt.Fprintf(os.Stderr, "Feature preview %s not found!", feature)
+		printAvailFeatures()
+		return false
+	}
 
-	return found
+	return enabled
 }
