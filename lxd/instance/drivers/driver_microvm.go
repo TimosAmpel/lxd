@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -376,6 +377,11 @@ func (d *microvm) libkrunAgentSocketPath() string {
 // libkrunExitFilePath returns the path to the libkrun helper exit state file.
 func (d *microvm) libkrunExitFilePath() string {
 	return filepath.Join(d.LogPath(), "libkrun.exit")
+}
+
+// microVMConfigPath returns the path to the generated libkrun VM config file.
+func (d *microvm) microVMConfigPath() string {
+	return filepath.Join(d.LogPath(), MicroVMConfigFileName)
 }
 
 // libkrunWatcherKey returns the map key used to track a libkrun watcher for this instance.
@@ -858,6 +864,19 @@ func (d *microvm) startLibkrun(ctx context.Context, op *operationlock.InstanceOp
 		cpuCount = MicroVMDefaultCPUCores
 	}
 
+	cpus, err := strconv.ParseUint(cpuCount, 10, 8)
+	if err != nil {
+		err = fmt.Errorf("limits.cpu invalid: %w", err)
+		op.Done(err)
+		return err
+	}
+
+	if memSizeMB <= 0 || memSizeMB > math.MaxUint32 {
+		err = fmt.Errorf("limits.memory invalid: %d MiB is out of range", memSizeMB)
+		op.Done(err)
+		return err
+	}
+
 	consolePath := d.libkrunConsolePath()
 
 	// Remove old console socket, PID file, and exit file if they exist.
@@ -868,7 +887,7 @@ func (d *microvm) startLibkrun(ctx context.Context, op *operationlock.InstanceOp
 	// Set up vsock for lxd-agent connectivity.
 	// Load vhost_vsock so the proxy goroutine can use vsock loopback to reach the LXD
 	// vsock server from the host side (agent→LXD direction).
-	err := util.LoadModule("vhost_vsock")
+	err = util.LoadModule("vhost_vsock")
 	if err != nil {
 		d.logger.Warn("Failed loading vhost_vsock module; lxd-agent vsock connectivity may be unavailable", logger.Ctx{"err": err})
 	}
@@ -878,39 +897,54 @@ func (d *microvm) startLibkrun(ctx context.Context, op *operationlock.InstanceOp
 
 	lxdProxySocket, guestProxyPort := d.ensureLibkrunVsockProxy()
 
+	// Build the MicroVM configuration.
+	configNICs := make([]MicroVMConfigNIC, 0, len(nics))
+	for _, nic := range nics {
+		configNICs = append(configNICs, MicroVMConfigNIC{
+			Tap:    nic.nicName,
+			HWAddr: nic.hwaddr,
+		})
+	}
+
+	cfg := MicroVMConfig{
+		CPUs:      uint8(cpus),
+		MemoryMiB: uint32(memSizeMB),
+		Kernel: MicroVMConfigKernel{
+			Path:    kernelPath,
+			Format:  "auto",
+			Cmdline: kernelCmdline,
+		},
+		RootDisk:    rootDiskPath,
+		ConfigDrive: d.configDriveMountPath(),
+		Console:     consolePath,
+		ExitFile:    d.libkrunExitFilePath(),
+		NICs:        configNICs,
+	}
+
+	if lxdProxySocket != "" && guestProxyPort != 0 {
+		cfg.Vsock = &MicroVMConfigVsock{
+			AgentSocket: agentSocketPath,
+			LXDPort:     uint32(guestProxyPort),
+			LXDSocket:   lxdProxySocket,
+		}
+	}
+
+	configPath := d.microVMConfigPath()
+	err = WriteMicroVMConfig(configPath, cfg)
+	if err != nil {
+		op.Done(err)
+		return err
+	}
+
 	// Build the forklibkrun helper command.
 	forkArgs := []string{
 		"forklibkrun",
-		"--cpus", cpuCount,
-		"--memory", strconv.FormatInt(memSizeMB, 10),
-		"--kernel", kernelPath,
-		"--cmdline", kernelCmdline,
-		"--root-disk", rootDiskPath,
-		"--config-drive", d.configDriveMountPath(),
-		"--console", consolePath,
-		"--exit-file", d.libkrunExitFilePath(),
+		"--config", configPath,
 		"--project", d.project.Name,
 		"--instance", d.Name(),
 	}
 
-	// Pass vsock socket paths when the proxy is available.
-	if lxdProxySocket != "" && guestProxyPort != 0 {
-		forkArgs = append(forkArgs,
-			"--vsock-agent-socket", agentSocketPath,
-			"--vsock-lxd-port", strconv.FormatUint(uint64(guestProxyPort), 10),
-			"--vsock-lxd-socket", lxdProxySocket,
-		)
-	}
-
-	// Add NIC configurations. libkrun's tap backend opens the host TAP device by name itself
-	// (inside the forklibkrun child, which runs as root), so the TAP device name and hardware
-	// address are passed through rather than a pre-opened file descriptor as used by QEMU.
-	// Interfaces appear in the guest as eth0, eth1, ... in the order added.
-	for _, nic := range nics {
-		forkArgs = append(forkArgs, "--net", fmt.Sprintf("%s,%s", nic.nicName, nic.hwaddr))
-	}
-
-	d.logger.Debug("Starting libkrun", logger.Ctx{"cmd": strings.Join(forkArgs, " ")})
+	d.logger.Debug("Starting libkrun", logger.Ctx{"config": configPath, "cmd": strings.Join(forkArgs, " ")})
 
 	// Setup the process using the subprocess package.
 	logFilePath := d.LogFilePath()
