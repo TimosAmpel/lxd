@@ -6239,21 +6239,26 @@ func (d *qemu) Update(ctx context.Context, args db.InstanceArgs, actionType inst
 		}
 
 		isLiveUpdatable := func(key string) bool {
+
 			// Skip container config keys for VMs
 			_, ok := instancetype.InstanceConfigKeysContainer[key]
 			if ok {
+
 				return true
 			}
 
 			if key == "limits.cpu" {
+
 				return d.architectureSupportsCPUHotplug()
 			}
 
 			if slices.Contains(liveUpdateKeys, key) {
+
 				return true
 			}
 
 			if shared.StringHasPrefix(key, liveUpdateKeyPrefixes...) {
+
 				return true
 			}
 
@@ -6301,9 +6306,7 @@ func (d *qemu) Update(ctx context.Context, args db.InstanceArgs, actionType inst
 			case "limits.memory":
 				err = d.updateMemoryLimit(value)
 				if err != nil {
-					if err != nil {
-						return fmt.Errorf("Failed updating memory limit: %w", err)
-					}
+					return fmt.Errorf("Failed updating memory limit: %w", err)
 				}
 			case "boot.mode":
 				// Defer rebuilding nvram until next start.
