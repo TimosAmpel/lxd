@@ -30,6 +30,7 @@ import (
 	"github.com/canonical/lxd/lxd/instance/operationlock"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/linux"
+	"github.com/canonical/lxd/lxd/response"
 	"github.com/canonical/lxd/lxd/state"
 	storagePools "github.com/canonical/lxd/lxd/storage"
 	storageDrivers "github.com/canonical/lxd/lxd/storage/drivers"
@@ -1622,4 +1623,127 @@ func (d *microvm) Console(ctx context.Context, protocol string) (*os.File, chan 
 	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceConsole.Event(ctx, d, logger.Ctx{"type": protocol}))
 
 	return file, chDisconnect, nil
+}
+
+// Delete the instance.
+func (d *microvm) Delete(ctx context.Context, force bool, diskVolumesMode string, progressReporter ioprogress.ProgressReporter) error {
+	return d.deleteCommon(ctx, d, force, diskVolumesMode, progressReporter)
+}
+
+// delete the instance without creating an operation lock.
+func (d *microvm) delete(ctx context.Context, force bool) error {
+	ctxMap := logger.Ctx{
+		"created":   d.creationDate,
+		"ephemeral": d.ephemeral,
+		"used":      d.lastUsedDate,
+	}
+
+	if d.isSnapshot {
+		d.logger.Info("Deleting instance snapshot", ctxMap)
+	} else {
+		d.logger.Info("Deleting instance", ctxMap)
+	}
+
+	// Check if instance is delete protected.
+	if !force && shared.IsTrue(d.expandedConfig["security.protection.delete"]) && !d.IsSnapshot() {
+		return errors.New("Instance is protected from being deleted")
+	}
+
+	err := d.checkRootVolumeNotInUse()
+	if err != nil {
+		return err
+	}
+
+	// Delete any persistent warnings for instance.
+	err = d.warningsDelete()
+	if err != nil {
+		return err
+	}
+
+	// Attempt to initialize storage interface for the instance.
+	pool, err := d.getStoragePool()
+	if err != nil && !response.IsNotFoundError(err) {
+		return err
+	} else if pool != nil {
+		if d.IsSnapshot() {
+			// Remove snapshot volume and database record.
+			err = pool.DeleteInstanceSnapshot(d, nil)
+			if err != nil {
+				return err
+			}
+		} else {
+			// Remove all snapshots.
+			err := d.deleteSnapshots(func(snapInst instance.Instance) error {
+				return snapInst.(*microvm).delete(ctx, true) // Internal delete function that does not lock.
+			})
+			if err != nil {
+				return fmt.Errorf("Failed deleting instance snapshots: %w", err)
+			}
+
+			// Remove the storage volume and database records.
+			err = pool.DeleteInstance(d, nil)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// Perform other cleanup steps if not snapshot.
+	if !d.IsSnapshot() {
+		// Remove all backups.
+		backups, err := d.Backups()
+		if err != nil {
+			return err
+		}
+
+		for _, backup := range backups {
+			err = backup.Delete(ctx)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Run device removal function for each device.
+		d.devicesRemove(d)
+
+		// Clean up libkrun runtime files and stop the libkrun monitor.
+		d.cleanupLibkrunRuntimeFiles()
+		d.stopLibkrunMonitor()
+
+		// Clean things up.
+		d.cleanup()
+
+		// Remove the log directory. Not handled by cleanup() as that is
+		// also called during Rename() where logs should be preserved.
+		_ = os.RemoveAll(d.LogPath())
+	}
+
+	err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		// Remove the database record of the instance or snapshot instance.
+		return tx.DeleteInstance(ctx, d.Project().Name, d.Name())
+	})
+	if err != nil {
+		d.logger.Error("Failed deleting instance entry", logger.Ctx{"project": d.Project().Name})
+		return err
+	}
+
+	if d.isSnapshot {
+		d.logger.Info("Deleted instance snapshot", ctxMap)
+	} else {
+		d.logger.Info("Deleted instance", ctxMap)
+	}
+
+	if d.isSnapshot {
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceSnapshotDeleted.Event(ctx, d, nil))
+	} else {
+		d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceDeleted.Event(ctx, d, nil))
+	}
+
+	return nil
+}
+
+// InitPID returns the instance's current process ID.
+func (d *microvm) InitPID() int {
+	pid, _ := d.libkrunPid()
+	return pid
 }
