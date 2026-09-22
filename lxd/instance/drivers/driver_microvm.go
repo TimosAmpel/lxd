@@ -3,6 +3,7 @@ package drivers
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,9 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/canonical/lxd/client"
+	"github.com/canonical/lxd/lxd/apparmor"
 	"github.com/canonical/lxd/lxd/db"
+	dbCluster "github.com/canonical/lxd/lxd/db/cluster"
 	"github.com/canonical/lxd/lxd/device"
 	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/lxd/instance"
@@ -1623,6 +1626,429 @@ func (d *microvm) Console(ctx context.Context, protocol string) (*os.File, chan 
 	d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceConsole.Event(ctx, d, logger.Ctx{"type": protocol}))
 
 	return file, chDisconnect, nil
+}
+
+// Update the instance config.
+func (d *microvm) Update(ctx context.Context, args db.InstanceArgs, actionType instance.UpdateAction) error {
+
+	userRequested := d.isUserRequested(actionType)
+
+	unlock, err := d.updateBackupFileLock(context.Background())
+	if err != nil {
+		return err
+	}
+
+	defer unlock()
+
+	// Setup a new operation.
+	op, err := operationlock.CreateWaitGet(d.Project().Name, d.Name(), operationlock.ActionUpdate, []operationlock.Action{operationlock.ActionRestart, operationlock.ActionRestore}, false, false)
+	if err != nil {
+		return fmt.Errorf("Failed creating instance update operation: %w", err)
+	}
+
+	defer op.Done(nil)
+
+	// Setup the reverter.
+	revert := revert.New()
+	defer revert.Fail()
+
+	// Set sane defaults for unset keys.
+	if args.Project == "" {
+		args.Project = api.ProjectDefaultName
+	}
+
+	if args.Architecture == 0 {
+		args.Architecture = d.architecture
+	}
+
+	if args.Config == nil {
+		args.Config = map[string]string{}
+	}
+
+	if args.Devices == nil {
+		args.Devices = deviceConfig.Devices{}
+	}
+
+	if args.Profiles == nil {
+		args.Profiles = []api.Profile{}
+	}
+
+	if userRequested {
+		// Validate the new config.
+		err := instance.ValidConfig(d.state.OS, args.Config, false, d.dbType)
+		if err != nil {
+			return fmt.Errorf("Invalid config: %w", err)
+		}
+
+		// Validate the new devices without using expanded devices validation (expensive checks disabled).
+		err = instance.ValidDevices(d.state, d.project, d.Type(), args.Devices, nil)
+		if err != nil {
+			return fmt.Errorf("Invalid devices: %w", err)
+		}
+	}
+
+	var profiles []string
+
+	err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		// Validate the new profiles.
+		profiles, err = tx.GetProfileNames(ctx, args.Project)
+
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("Failed getting profiles: %w", err)
+	}
+
+	checkedProfiles := []string{}
+	for _, profile := range args.Profiles {
+		if !slices.Contains(profiles, profile.Name) {
+			return fmt.Errorf("Requested profile %q does not exist", profile.Name)
+		}
+
+		if slices.Contains(checkedProfiles, profile.Name) {
+			return errors.New("Duplicate profile found in request")
+		}
+
+		checkedProfiles = append(checkedProfiles, profile.Name)
+	}
+
+	// Validate the new architecture.
+	if args.Architecture != 0 {
+		_, err = osarch.ArchitectureName(args.Architecture)
+		if err != nil {
+			return fmt.Errorf("Invalid architecture ID: %w", err)
+		}
+	}
+
+	// Get a copy of the old configuration.
+	oldDescription := d.Description()
+	oldArchitecture := 0
+	err = shared.DeepCopy(&d.architecture, &oldArchitecture)
+	if err != nil {
+		return err
+	}
+
+	oldEphemeral := false
+	err = shared.DeepCopy(&d.ephemeral, &oldEphemeral)
+	if err != nil {
+		return err
+	}
+
+	oldExpandedDevices := deviceConfig.Devices{}
+	err = shared.DeepCopy(&d.expandedDevices, &oldExpandedDevices)
+	if err != nil {
+		return err
+	}
+
+	oldExpandedConfig := map[string]string{}
+	err = shared.DeepCopy(&d.expandedConfig, &oldExpandedConfig)
+	if err != nil {
+		return err
+	}
+
+	oldLocalDevices := deviceConfig.Devices{}
+	err = shared.DeepCopy(&d.localDevices, &oldLocalDevices)
+	if err != nil {
+		return err
+	}
+
+	oldLocalConfig := map[string]string{}
+	err = shared.DeepCopy(&d.localConfig, &oldLocalConfig)
+	if err != nil {
+		return err
+	}
+
+	oldProfiles := []api.Profile{}
+	err = shared.DeepCopy(&d.profiles, &oldProfiles)
+	if err != nil {
+		return err
+	}
+
+	oldExpiryDate := d.expiryDate
+
+	// Revert local changes if update fails.
+	revert.Add(func() {
+		d.description = oldDescription
+		d.architecture = oldArchitecture
+		d.ephemeral = oldEphemeral
+		d.expandedConfig = oldExpandedConfig
+		d.expandedDevices = oldExpandedDevices
+		d.localConfig = oldLocalConfig
+		d.localDevices = oldLocalDevices
+		d.profiles = oldProfiles
+		d.expiryDate = oldExpiryDate
+	})
+
+	// Apply the various changes to local vars.
+	d.description = args.Description
+	d.architecture = args.Architecture
+	d.ephemeral = args.Ephemeral
+	d.localConfig = args.Config
+	d.localDevices = args.Devices
+	d.profiles = args.Profiles
+	d.expiryDate = args.ExpiryDate
+
+	// Expand the config.
+	err = d.expandConfig()
+	if err != nil {
+		return err
+	}
+
+	// Diff the configurations.
+	changedConfig := []string{}
+	for key := range oldExpandedConfig {
+		if oldExpandedConfig[key] != d.expandedConfig[key] {
+			if !slices.Contains(changedConfig, key) {
+				changedConfig = append(changedConfig, key)
+			}
+		}
+	}
+
+	for key := range d.expandedConfig {
+		if oldExpandedConfig[key] != d.expandedConfig[key] {
+			if !slices.Contains(changedConfig, key) {
+				changedConfig = append(changedConfig, key)
+			}
+		}
+	}
+
+	// Diff the devices.
+	removeDevices, addDevices, updateDevices, allUpdatedDeviceKeys := oldExpandedDevices.Update(d.expandedDevices, func(oldDevice deviceConfig.Device, newDevice deviceConfig.Device) []string {
+		// This function needs to return a list of fields that are excluded from differences
+		// between oldDevice and newDevice. The result of this is that as long as the
+		// devices are otherwise identical except for the fields returned here, then the
+		// device is considered to be being "updated" rather than "added & removed".
+		oldDevType, err := device.LoadByType(d.state, d.Project().Name, oldDevice)
+		if err != nil {
+			return []string{} // Could not create Device, so this cannot be an update.
+		}
+
+		newDevType, err := device.LoadByType(d.state, d.Project().Name, newDevice)
+		if err != nil {
+			return []string{} // Could not create Device, so this cannot be an update.
+		}
+
+		return newDevType.UpdatableFields(oldDevType)
+	})
+
+	err = d.validateConfig(allUpdatedDeviceKeys, addDevices, removeDevices, oldExpandedDevices, changedConfig, oldExpandedConfig, actionType)
+	if err != nil {
+		return err
+	}
+
+	// If apparmor changed, re-validate the apparmor profile (even if not running).
+	if slices.Contains(changedConfig, "raw.apparmor") {
+		err = apparmor.InstanceValidate(d.state.OS, d)
+		if err != nil {
+			return fmt.Errorf("Parse AppArmor profile: %w", err)
+		}
+	}
+
+	isRunning := d.IsRunning()
+
+	// Use the device interface to apply update changes.
+	devlxdEvents, err := d.devicesUpdate(d, removeDevices, addDevices, updateDevices, oldExpandedDevices, isRunning, userRequested)
+	if err != nil {
+		return err
+	}
+
+	if isRunning {
+		// Re-generate the agent mounts file so that it reflects the current devices set.
+		// This way if a directory disk is added immediately after VM start but before the lxd-agent has
+		// started in the guest (such that it misses the devlxd notification event), the agent will still
+		// be able to see the mount config for the new disk when it starts.
+		err = d.generateAgentMountsFile()
+		if err != nil {
+			return fmt.Errorf("Failed generating agent mounts file: %w", err)
+		}
+
+		// Only certain keys can be changed on a running VM.
+		liveUpdateKeys := []string{
+			"cluster.evacuate",
+			"security.agent.metrics",
+			"boot.mode",
+			"security.devlxd",
+			"security.devlxd.images",
+			"security.devlxd.management.volumes",
+		}
+
+		liveUpdateKeyPrefixes := []string{
+			"boot.",
+			"cloud-init.",
+			"environment.",
+			"image.",
+			"snapshots.",
+			"user.",
+			"volatile.",
+		}
+
+		isLiveUpdatable := func(key string) bool {
+
+			// Containers / metadata / user / environment keys allowed
+			if slices.Contains(liveUpdateKeys, key) || shared.StringHasPrefix(key, liveUpdateKeyPrefixes...) {
+				return true
+			}
+			// Everything else (like limits.cpu, limits.memory) is rejected while running
+			return false
+		}
+
+		// Check only keys that support live update have changed.
+		for _, key := range changedConfig {
+			if !isLiveUpdatable(key) {
+				return fmt.Errorf("Key %q cannot be updated when VM is running", key)
+			}
+		}
+
+		// Apply live update for each key.
+		for _, key := range changedConfig {
+
+			switch key {
+			case "boot.mode":
+				// Defer rebuilding nvram until next start.
+				d.localConfig["volatile.apply_nvram"] = "true"
+			case "security.devlxd":
+				err = d.advertiseVsockAddress()
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if d.architectureSupportsUEFI(d.architecture) && slices.Contains(changedConfig, "boot.mode") {
+		// setupNvram() requires instance's config volume to be mounted.
+		// The easiest way to detect that is to check if instance is running.
+		// TODO: extend storage API to be able to check if volume is already mounted?
+		if !isRunning {
+			// Mount the instance's config volume.
+			_, err := d.mount()
+			if err != nil {
+				return err
+			}
+
+			defer func() { _ = d.unmount() }()
+		}
+
+		// Re-generate the NVRAM.
+		err = d.setupNvram()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Re-generate the instance-id if needed.
+	if !d.IsSnapshot() && d.needsNewInstanceID(changedConfig, oldExpandedDevices) {
+		err = d.resetInstanceID()
+		if err != nil {
+			return err
+		}
+	}
+
+	// If the instance is now assigned to a "placement.group", remove any previous "volatile.cluster.group".
+	// This ensures the placement group takes precedence and avoids stale cluster group targeting during evacuation.
+	if d.expandedConfig["placement.group"] != "" {
+		if oldLocalConfig["volatile.cluster.group"] != "" {
+			delete(d.localConfig, "volatile.cluster.group")
+		}
+
+	}
+	// Finally, apply the changes to the database.
+	err = d.state.DB.Cluster.Transaction(context.TODO(), func(ctx context.Context, tx *db.ClusterTx) error {
+		// Snapshots should update only their descriptions and expiry date.
+		if d.IsSnapshot() {
+			return tx.UpdateInstanceSnapshot(d.id, d.description, d.expiryDate)
+		}
+
+		object, err := dbCluster.GetInstance(ctx, tx.Tx(), d.project.Name, d.name)
+		if err != nil {
+			return err
+		}
+
+		object.Description = d.description
+		object.Architecture = d.architecture
+		object.Ephemeral = d.ephemeral
+		object.ExpiryDate = sql.NullTime{Time: d.expiryDate, Valid: true}
+
+		err = dbCluster.UpdateInstance(ctx, tx.Tx(), d.project.Name, d.name, *object)
+		if err != nil {
+			return err
+		}
+
+		err = dbCluster.UpdateInstanceConfig(ctx, tx.Tx(), int64(object.ID), d.localConfig)
+		if err != nil {
+			return err
+		}
+
+		// Do not store initial.* device config keys in database.
+		initialDevicesConfig := d.localDevices.CutInitialConfig()
+		defer func() { initialDevicesConfig.Copy(d.localDevices) }() // Restore after DB transaction.
+
+		devices, err := dbCluster.APIToDevices(d.localDevices.CloneNative())
+		if err != nil {
+			return err
+		}
+
+		err = dbCluster.UpdateInstanceDevices(ctx, tx.Tx(), int64(object.ID), devices)
+		if err != nil {
+			return err
+		}
+
+		profileNames := make([]string, 0, len(d.profiles))
+		for _, profile := range d.profiles {
+			profileNames = append(profileNames, profile.Name)
+		}
+
+		return dbCluster.UpdateInstanceProfiles(ctx, tx.Tx(), object.ID, object.Project, profileNames)
+	})
+	if err != nil {
+		return fmt.Errorf("Failed updating database: %w", err)
+	}
+
+	err = d.UpdateBackupFile()
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("Failed writing backup file: %w", err)
+	}
+
+	// Changes have been applied and recorded, do not revert if an error occurs from here.
+	revert.Success()
+
+	if isRunning {
+		// Send devlxd notifications only for user.* key changes
+		for _, key := range changedConfig {
+			if !strings.HasPrefix(key, "user.") {
+				continue
+			}
+
+			msg := map[string]any{
+				"key":       key,
+				"old_value": oldExpandedConfig[key],
+				"value":     d.expandedConfig[key],
+			}
+
+			err = d.devlxdEventSend("config", msg)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Device events.
+		for _, event := range devlxdEvents {
+			err = d.devlxdEventSend("device", event)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if userRequested {
+		if d.isSnapshot {
+			d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceSnapshotUpdated.Event(ctx, d, nil))
+		} else {
+			d.state.Events.SendLifecycle(d.project.Name, lifecycle.InstanceUpdated.Event(ctx, d, nil))
+		}
+	}
+
+	return nil
 }
 
 // Delete the instance.
