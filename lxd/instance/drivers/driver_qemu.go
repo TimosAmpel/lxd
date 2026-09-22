@@ -2118,11 +2118,16 @@ func (d *qemu) getAgentConnectionInfo() (*agentAPI.API10Put, error) {
 		return nil, errors.New("Listen address is not vsock.Addr")
 	}
 
+	port := vsockaddr.Port
+	if d.Type() == instancetype.MicroVM {
+		port = libkrunVsockProxyPort
+	}
+
 	req := agentAPI.API10Put{
 		Certificate: string(d.state.Endpoints.NetworkCert().PublicKey()),
 		Devlxd:      shared.IsTrueOrEmpty(d.expandedConfig["security.devlxd"]),
 		CID:         vsock.Host, // Always tell lxd-agent to connect to LXD using Host Context ID to support nesting.
-		Port:        vsockaddr.Port,
+		Port:        port,
 	}
 
 	return &req, nil
@@ -6286,21 +6291,26 @@ func (d *qemu) Update(ctx context.Context, args db.InstanceArgs, actionType inst
 		}
 
 		isLiveUpdatable := func(key string) bool {
+
 			// Skip container config keys for VMs
 			_, ok := instancetype.InstanceConfigKeysContainer[key]
 			if ok {
+
 				return true
 			}
 
 			if key == "limits.cpu" {
+
 				return d.architectureSupportsCPUHotplug()
 			}
 
 			if slices.Contains(liveUpdateKeys, key) {
+
 				return true
 			}
 
 			if shared.StringHasPrefix(key, liveUpdateKeyPrefixes...) {
+
 				return true
 			}
 
@@ -8622,7 +8632,13 @@ func (d *qemu) renderState(statusCode api.StatusCode, opts ...instance.StateRend
 	}
 
 	status := &api.InstanceState{}
-	pid, _ := d.pid()
+
+	var pid int
+	if d.Type() == instancetype.MicroVM {
+		pid = d.InitPID()
+	} else {
+		pid, _ = d.pid()
+	}
 
 	if d.isRunningStatusCode(statusCode) {
 		if d.agentMetricsEnabled() {
